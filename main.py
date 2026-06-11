@@ -1,241 +1,251 @@
 """
-Course Registration API - Phase 1
-Endpoints:
-  POST /api/v1/admin/catalog/import  - Upload & parse HTML catalog
-  GET  /api/v1/catalog/courses/{course_code} - Retrieve a course by code
+Course Registration API - Phase 2
+Student Profile Ingestion & Data Normalization
 """
 
 import re
 from typing import Any
-
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Course Catalog API")
+app = FastAPI(title="Course Registration API - Phase 2")
 
-# In-memory store: { "COSC3506": { ...course dict... }, ... }
-catalog: dict[str, dict[str, Any]] = {}
+# Per-student state: { student_id: { "history": [...], "plan": [...] } }
+students: dict[str, dict[str, list]] = {}
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# HTML Transcript Parsing
 # ---------------------------------------------------------------------------
 
-COURSE_CODE_RE = re.compile(r"\b([A-Z]{2,8}\s*\d{3,5}[A-Z]?)\b")
+VALID_STATUSES = {"completed", "in-progress", "attempted"}
 
 
-def _normalize_code(raw: str) -> str:
-    """Remove internal whitespace and uppercase: 'COSC 3506' -> 'COSC3506'."""
-    return re.sub(r"\s+", "", raw.strip().upper())
+def _grade_priority(grade: str) -> int:
+    """Higher = more informative. Numeric > letter > P/blank."""
+    g = grade.strip()
+    if not g or g == "P":
+        return 0
+    if re.match(r'^[A-Fa-f][+-]?$', g):
+        return 1
+    try:
+        float(g)
+        return 2
+    except ValueError:
+        return 1
 
 
-def _extract_codes(text: str) -> list[str]:
-    """Return all course codes found in a text string (normalised)."""
-    return [_normalize_code(m) for m in COURSE_CODE_RE.findall(text)]
-
-
-def _parse_prerequisites(raw: str) -> list[str]:
+def _parse_transcript(html_bytes: bytes) -> list[dict]:
     """
-    Turn a messy prerequisites string into a list of course codes.
-    Works regardless of surrounding prose like
-    'Requires COSC 1046 and either COSC 1047 or ITEC 1047'.
-    """
-    if not raw or raw.strip().lower() in ("none", "n/a", "-", ""):
-        return []
-    return _extract_codes(raw)
-
-
-def _parse_cross_listed(raw: str) -> list[str]:
-    """Extract cross-listed course codes from a cell string."""
-    if not raw or raw.strip().lower() in ("none", "n/a", "-", ""):
-        return []
-    return _extract_codes(raw)
-
-
-def _parse_catalog_html(html_bytes: bytes) -> dict[str, dict[str, Any]]:
-    """
-    Parse the course-catalog HTML.
-
-    Expected table structure (generalised - no hardcoded course names):
-        Column 0: Course Code
-        Column 1: Title
-        Column 2: Credits
-        Column 3: Prerequisites  (may be absent)
-        Column 4: Cross-listed   (may be absent)
-
-    The function is tolerant of different column counts and orders by
-    inspecting the <th> header row first.
+    Parse student transcript HTML.
+    Headers: Status · Course · (title) · Grade · Term · Credits
+    Rules:
+    - Status in {Completed, In-Progress, Attempted}
+    - Term cell must be non-empty
+    - Deduplicate by (course_code, term): keep most informative grade, then higher credits
     """
     soup = BeautifulSoup(html_bytes, "html.parser")
-    courses: dict[str, dict[str, Any]] = {}
+    raw_rows: list[dict] = []
 
     for table in soup.find_all("table"):
-        # ---- detect header row ------------------------------------------------
-        header_cells = table.find("tr")
-        if not header_cells:
+        # Find header row
+        header_row = table.find("tr")
+        if not header_row:
             continue
 
         headers = [th.get_text(strip=True).lower()
-                   for th in header_cells.find_all(["th", "td"])]
+                   for th in header_row.find_all(["th", "td"])]
 
-        if not headers:
+        # Check this table has the right columns
+        if "status" not in headers or "course" not in headers:
             continue
 
-        # Build a flexible column-index map from whatever headers exist
-        col_map = _build_col_map(headers)
+        # Map column names to indices
+        try:
+            status_idx = headers.index("status")
+            course_idx = headers.index("course")
+            term_idx   = next(i for i, h in enumerate(headers) if "term" in h)
+            credits_idx = next(i for i, h in enumerate(headers) if "credit" in h)
+            grade_idx  = next(i for i, h in enumerate(headers) if "grade" in h)
+        except (ValueError, StopIteration):
+            continue
 
-        # We need at least a course-code column and a title column to proceed
-        if "code" not in col_map or "title" not in col_map:
-            # Try heuristic: if first column looks like course codes in data rows
-            if not _table_has_course_codes(table):
-                continue
-            # Assign positional defaults
-            col_map = {"code": 0, "title": 1, "credits": 2,
-                       "prerequisites": 3, "cross_listed": 4}
-
-        # ---- iterate data rows ------------------------------------------------
-        rows = table.find_all("tr")[1:]  # skip header
-        for row in rows:
+        for row in table.find_all("tr")[1:]:
             cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
+
+            def cell(idx):
+                return cells[idx].get_text(strip=True) if idx < len(cells) else ""
+
+            status  = cell(status_idx)
+            course  = cell(course_idx)
+            term    = cell(term_idx)
+            grade   = cell(grade_idx)
+            credits_raw = cell(credits_idx)
+
+            # Apply canonical rule
+            if status.lower() not in VALID_STATUSES:
+                continue
+            if not term:
+                continue
+            if not course:
                 continue
 
-            def cell_text(idx: int) -> str:
-                if idx < len(cells):
-                    return cells[idx].get_text(separator=" ", strip=True)
-                return ""
-
-            raw_code = cell_text(col_map.get("code", 0))
-            code = _normalize_code(raw_code)
-
-            if not code or not COURSE_CODE_RE.match(raw_code.strip()):
-                # Skip rows that don't start with a valid course code
-                continue
-
-            title = cell_text(col_map.get("title", 1))
-
-            credits_raw = cell_text(col_map.get("credits", 2))
             try:
-                credits = int(re.search(r"\d+", credits_raw).group())
-            except (AttributeError, ValueError):
-                credits = 0
+                credits_earned = int(float(credits_raw))
+            except (ValueError, TypeError):
+                credits_earned = 0
 
-            prereq_raw = cell_text(col_map.get("prerequisites", 3))
-            cross_raw = cell_text(col_map.get("cross_listed", 4))
+            raw_rows.append({
+                "course_code":    course,
+                "term":           term,
+                "credits_earned": credits_earned,
+                "status":         status,
+                "grade":          grade,
+            })
 
-            courses[code] = {
-                "course_code": code,
-                "title": title,
-                "credits": credits,
-                "prerequisites": _parse_prerequisites(prereq_raw),
-                "cross_listed": _parse_cross_listed(cross_raw),
-            }
+    # Deduplicate by (course_code, term)
+    best: dict[tuple, dict] = {}
+    for row in raw_rows:
+        key = (row["course_code"], row["term"])
+        if key not in best:
+            best[key] = row
+        else:
+            existing = best[key]
+            ep = _grade_priority(existing["grade"])
+            np = _grade_priority(row["grade"])
+            if np > ep or (np == ep and row["credits_earned"] > existing["credits_earned"]):
+                best[key] = row
 
-    return courses
+    # Return clean records (drop internal grade field)
+    result = []
+    for row in best.values():
+        result.append({
+            "course_code":    row["course_code"],
+            "term":           row["term"],
+            "credits_earned": row["credits_earned"],
+            "status":         row["status"],
+        })
 
-
-def _build_col_map(headers: list[str]) -> dict[str, int]:
-    """
-    Map semantic field names to column indices using keyword matching.
-    Handles variations like 'course code', 'code', 'course #', etc.
-    """
-    col_map: dict[str, int] = {}
-    keyword_map = {
-        "code":          ["code", "course code", "course #", "course no", "coursecode"],
-        "title":         ["title", "course title", "name", "course name"],
-        "credits":       ["credits", "credit", "units", "hrs", "hours"],
-        "prerequisites": ["prerequisites", "prerequisite", "prereq", "pre-req",
-                          "pre req", "required", "requirement"],
-        "cross_listed":  ["cross", "cross-listed", "crosslisted", "also listed"],
-    }
-    for i, h in enumerate(headers):
-        for field, keywords in keyword_map.items():
-            if field not in col_map and any(kw in h for kw in keywords):
-                col_map[field] = i
-    return col_map
-
-
-def _table_has_course_codes(table) -> bool:
-    """Heuristic: check whether the first data column contains course codes."""
-    rows = table.find_all("tr")[1:4]  # sample first 3 data rows
-    for row in rows:
-        cells = row.find_all(["td", "th"])
-        if cells and COURSE_CODE_RE.search(cells[0].get_text(strip=True)):
-            return True
-    return False
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# History Endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/admin/catalog/import")
-async def import_catalog(file: UploadFile = File(...)):
-    """
-    Accept a multipart/form-data HTML file upload, parse the course catalog,
-    and store it in memory.
-    """
-    if not file.filename.lower().endswith((".html", ".htm")):
-        raise HTTPException(status_code=400,
-                            detail="Only .html / .htm files are accepted.")
-
+@app.post("/api/v1/students/{student_id}/history/import", status_code=201)
+async def import_history(student_id: str, file: UploadFile = File(...)):
+    """Parse HTML transcript and store as student's history."""
     html_bytes = await file.read()
     if not html_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    parsed = _parse_catalog_html(html_bytes)
+    courses = _parse_transcript(html_bytes)
 
-    if not parsed:
-        raise HTTPException(status_code=422,
-                            detail="No courses could be parsed from the file. "
-                                   "Ensure the HTML contains a valid course table.")
+    if student_id not in students:
+        students[student_id] = {"history": [], "plan": []}
 
-    catalog.clear()
-    catalog.update(parsed)
+    students[student_id]["history"] = courses
 
     return JSONResponse(
-        status_code=200,
+        status_code=201,
         content={
-            "message": "Catalog imported successfully.",
-            "courses_imported": len(catalog),
-            "course_codes": sorted(catalog.keys()),
-        },
+            "status": "success",
+            "past_courses_imported": len(courses),
+        }
     )
 
 
-@app.get("/api/v1/catalog/courses/{course_code}")
-async def get_course(course_code: str):
-    """
-    Return a single course record by code (case-insensitive, space-tolerant).
-    Example: GET /api/v1/catalog/courses/COSC3506
-             GET /api/v1/catalog/courses/COSC%203506  (both work)
-    """
-    normalized = _normalize_code(course_code)
-    course = catalog.get(normalized)
-    if not course:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Course '{normalized}' not found. "
-                   f"Import a catalog first or check the course code.",
-        )
-    return course
+@app.put("/api/v1/students/{student_id}/history")
+async def update_history(student_id: str, body: dict):
+    """Overwrite student's history with provided JSON array."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
+
+    history = body.get("history", [])
+    students[student_id]["history"] = history
+
+    return {"status": "success", "message": "Academic history updated successfully"}
 
 
-@app.get("/api/v1/catalog/courses")
-async def list_courses():
-    """Return all courses currently in memory (convenience endpoint)."""
-    return {"total": len(catalog), "courses": list(catalog.values())}
+@app.delete("/api/v1/students/{student_id}/history")
+async def delete_history(student_id: str):
+    """Clear student's history."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
 
+    students[student_id]["history"] = []
+    return {"status": "success", "message": "Academic history cleared."}
+
+
+# ---------------------------------------------------------------------------
+# Plan Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/students/{student_id}/plan")
+async def create_plan(student_id: str, body: dict):
+    """Store a course plan for an existing student."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
+
+    planned = body.get("planned_courses", [])
+    students[student_id]["plan"] = planned
+
+    return {
+        "status": "success",
+        "planned_courses_saved": len(planned),
+    }
+
+
+@app.put("/api/v1/students/{student_id}/plan")
+async def update_plan(student_id: str, body: dict):
+    """Replace student's plan entirely."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
+
+    planned = body.get("planned_courses", [])
+    students[student_id]["plan"] = planned
+
+    return {
+        "status": "success",
+        "planned_courses_saved": len(planned),
+        "message": "Plan updated successfully.",
+    }
+
+
+@app.delete("/api/v1/students/{student_id}/plan")
+async def delete_plan(student_id: str):
+    """Clear student's plan."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
+
+    students[student_id]["plan"] = []
+    return {"status": "success", "message": "Plan cleared."}
+
+
+# ---------------------------------------------------------------------------
+# Profile Endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/students/{student_id}/profile")
+async def get_profile(student_id: str):
+    """Return unified student profile."""
+    if student_id not in students:
+        raise HTTPException(status_code=404, detail=f"Student '{student_id}' not found.")
+
+    s = students[student_id]
+    return {
+        "student_id": student_id,
+        "history":    s["history"],
+        "plan":       s["plan"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Root
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Course Catalog API is running.",
-        "docs": "/docs",
-        "endpoints": {
-            "import_catalog": "POST /api/v1/admin/catalog/import",
-            "get_course":     "GET  /api/v1/catalog/courses/{course_code}",
-            "list_courses":   "GET  /api/v1/catalog/courses",
-        },
-    }
+    return {"message": "Course Registration API Phase 2 running", "docs": "/docs"}
