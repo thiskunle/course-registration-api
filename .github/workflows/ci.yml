@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn beautifulsoup4 python-multipart
+          pip install flake8 pytest pytest-cov httpx
+
+      - name: Lint with flake8
+        run: |
+          flake8 main.py --max-line-length=120 --ignore=E501,W503
+
+      - name: Run tests with coverage
+        run: |
+          pytest test_main.py -v --cov=main --cov-fail-under=80
+
+      - name: Integration test (boot API + hit endpoints)
+        run: |
+          uvicorn main:app --host 127.0.0.1 --port 8000 &
+          sleep 3
+          curl -f http://127.0.0.1:8000/ || exit 1
+          echo "API is up"
